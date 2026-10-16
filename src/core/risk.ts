@@ -60,31 +60,70 @@ export function checkVenue(m: Pick<VenueMarket, "venue" | "rules" | "resolutionS
 }
 
 const DIFF_SEV: Record<string, Flag["severity"]> = { resolution_source: "medium", threshold: "high", scope: "medium", end_date: "medium", start_date: "low", resolution_timing: "low", edge_cases: "medium", wording: "low" };
-const DIFF_EXPL: Record<string, string> = {
-  resolution_source: "Venues name different resolution sources, so the same event could be graded differently.",
-  threshold: "Venues use different thresholds. These may not be the same bet.",
-  scope: "Venues define the event's scope differently.",
-  end_date: "Venues have different deadlines.",
-  start_date: "Venues count from different start dates.",
-  resolution_timing: "Venues settle at different times, so capital unlocks at different times.",
-  edge_cases: "Venues handle an edge case differently; in that case one could pay and the other not.",
-  wording: "Wording differs in a way that could matter at the margin.",
-};
-export function crossVenue(ms: VenueMarket[], diff: { type: string; title: string; venues: string[] }[] | null): Flag[] {
+
+// Settlement clauses that change who gets paid in rare paths. One venue having it and another not = real mismatch.
+export const CLAUSES: { key: string; label: string; re: RegExp; diffTypes: string[] }[] = [
+  { key: "cancellation", label: "what happens if the event is cancelled, postponed or no result is published", re: /\b(cancel+ed|cancel+ation|postpone[ds]?|not occur|does not take place|no statement|no (official )?(result|data) (is )?(released|published))/i, diffTypes: ["edge_cases", "resolution_timing"] },
+  { key: "rounding", label: "how off-grid outcomes are rounded into a bracket", re: /\brounded?\b|nearest \d+/i, diffTypes: ["threshold", "edge_cases"] },
+  { key: "tie", label: "how ties or draws settle", re: /\b(tie|ties|tied|draw)\b/i, diffTypes: ["edge_cases"] },
+  { key: "revision", label: "whether revised data counts", re: /\b(revis(ed|ion)s?|preliminary|initial (release|estimate))\b/i, diffTypes: ["resolution_source", "edge_cases"] },
+  { key: "early_close", label: "early close or early resolution", re: /\b(resolve[sd]? early|close early|early (close|expiration|resolution)|as soon as)\b/i, diffTypes: ["resolution_timing"] },
+  { key: "void", label: "voids, refunds or 50-50 settlement", re: /\b(void|refund|50-50|50\/50|split)\b/i, diffTypes: ["edge_cases"] },
+];
+const STOP = new Set("the and for with that this from will market resolves resolve venue venues rules into than when what which".split(" "));
+const sig = (s: string) => [...new Set(s.toLowerCase().replace(/[^a-z0-9.\s]/g, " ").split(/\s+/).filter((w) => w.length >= 4 && !STOP.has(w)))];
+
+type Diff = { type: string; title: string; summary: string; perVenue: Record<string, string> };
+
+/** Cross-venue settlement risk. Agg's settlementDiff text is used, then checked against each venue's full rules:
+ *  if Agg says a venue doesn't cover something but its rules do, we correct it (and quote the clause). */
+export function crossVenue(ms: VenueMarket[], diff: Diff[] | null): Flag[] {
   const f: Flag[] = [];
   if (ms.length < 2) return f;
-  if (diff) for (const d of diff) f.push({ check: "settlement_mismatch", severity: DIFF_SEV[d.type] ?? "low", venue: "cross-venue", quote: null,
-    explanation: `${d.title}: ${DIFF_EXPL[d.type] ?? "Venues settle this differently."}${d.venues.length ? ` (spelled out on ${d.venues.join(", ")})` : ""}` });
-  // own checks independent of Agg's diff
-  const times = ms.map((m) => m.closeTime ? Date.parse(m.closeTime) : NaN).filter(Number.isFinite);
+  const venues = ms.map((m) => m.venue);
+  const ss = new Map(ms.map((m) => [m.venue, sentences(m.rules)]));
+  const coveredClauses = new Set<string>(); // clause keys already explained by an Agg diff
+  for (const d of diff ?? []) {
+    const named = Object.keys(d.perVenue).filter((v) => venues.includes(v));
+    const silent = venues.filter((v) => !named.includes(v));
+    const aggText = `Agg: ${d.summary || d.title}`;
+    // Which of our clause families does this diff talk about?
+    const fam = CLAUSES.find((c) => c.re.test(`${d.title} ${d.summary} ${Object.values(d.perVenue).join(" ")}`));
+    if (fam) coveredClauses.add(fam.key);
+    const corrections: string[] = []; let quote: string | null = null;
+    for (const v of silent) {
+      const vs = ss.get(v) ?? [];
+      // 1) same clause family present in the "silent" venue's full rules?
+      let hit = fam ? find(vs, fam.re) : null;
+      // 2) otherwise: do the silent venue's rules contain most of the distinctive words Agg attributes to the others?
+      if (!hit) {
+        const words = sig(Object.values(d.perVenue).join(" "));
+        const best = vs.map((s) => ({ s, k: words.filter((w) => s.toLowerCase().includes(w)).length })).sort((a, b) => b.k - a.k)[0];
+        if (best && words.length >= 3 && best.k / words.length >= 0.5) hit = best.s;
+      }
+      if (hit) { corrections.push(v); quote = quote ?? hit; }
+    }
+    const per = Object.entries(d.perVenue).filter(([v]) => venues.includes(v)).map(([v, t]) => `${v}: ${clip(String(t), 120)}`).join("; ");
+    if (corrections.length && corrections.length === silent.length) {
+      f.push({ check: "settlement_mismatch", severity: fam?.key === "cancellation" ? "low" : "info", venue: "cross-venue", quote: clip(quote),
+        explanation: `${d.title}: ${aggText} Fine Print correction: ${corrections.join(", ")}'s full rules do cover this (quoted)${fam?.key === "cancellation" ? ", so the real difference is the trigger and timing, not whether it is covered" : ""}. ${per}` });
+    } else {
+      f.push({ check: "settlement_mismatch", severity: DIFF_SEV[d.type] ?? "low", venue: "cross-venue", quote: null, explanation: `${d.title}: ${aggText}${per ? ` (${per})` : ""}` });
+    }
+  }
+  // Our own one-sided clause check over full rules (catches what Agg misses, e.g. Polymarket's rounding clause).
+  for (const c of CLAUSES) {
+    if (coveredClauses.has(c.key)) continue;
+    const has = ms.map((m) => find(ss.get(m.venue) ?? [], c.re));
+    if (has.some(Boolean) && has.some((x) => !x)) {
+      const yes = ms.filter((_, i) => has[i]).map((m) => m.venue), no = ms.filter((_, i) => !has[i]).map((m) => m.venue);
+      f.push({ check: "settlement_mismatch", severity: c.key === "early_close" ? "low" : "medium", venue: "cross-venue", quote: clip(has.find(Boolean)!),
+        explanation: `Only ${yes.join(", ")} spells out ${c.label}; ${no.join(", ")} does not, so in that case the venues could settle differently.` });
+    }
+  }
+  const times = ms.map((m) => (m.closeTime ? Date.parse(m.closeTime) : NaN)).filter(Number.isFinite);
   if (times.length >= 2) { const hrs = (Math.max(...times) - Math.min(...times)) / 36e5;
     if (hrs > 24) f.push({ check: "settlement_mismatch", severity: hrs > 168 ? "high" : "medium", venue: "cross-venue", quote: null, explanation: `Close times differ by ${(hrs / 24).toFixed(1)} days across venues.` }); }
-  const cancel = ms.map((m) => find(sentences(m.rules), /cancel|not occur|no statement|postpone/i));
-  if (cancel.some(Boolean) && cancel.some((c) => !c)) {
-    const has = ms.filter((_, i) => cancel[i]).map((m) => m.venue);
-    f.push({ check: "settlement_mismatch", severity: "medium", venue: "cross-venue", quote: clip(cancel.find(Boolean)!),
-      explanation: `Only ${has.join(", ")} says what happens if the event is cancelled or postponed.` });
-  }
   return f;
 }
 

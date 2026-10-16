@@ -13,6 +13,9 @@ export interface VenueMarket {
   spread: number | null;
   yesAsk: number | null;
   feeRate: number | null;        // Agg feeRate (fraction) when known
+  status?: "ok" | "unavailable"; // unavailable = listed but no live price / fetch failed
+  unavailableReason?: string;
+  matchedBy?: "agg" | "fine_print_outcome_parser" | "caller";
 }
 export interface Severity { level: "high" | "medium" | "low" | "info" }
 export interface Flag {
@@ -26,7 +29,7 @@ export interface Bundle {
   source: "agg" | "public";
   markets: VenueMarket[];
   anchorIndex: number;
-  settlementDiff: { type: string; title: string; venues: string[] }[] | null;
+  settlementDiff: { type: string; title: string; summary: string; perVenue: Record<string, string> }[] | null;
   route: { venue: string; avgPrice: number; shares: number; totalCost: number; fees: number; spend: number } | null;
   warnings: string[];
 }

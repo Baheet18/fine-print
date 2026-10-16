@@ -51,9 +51,12 @@ async function loadAgg(appId: string, inp: CheckInput, spend: number): Promise<B
     try {
       const extra = await agg.lookup(appId, other.venue, other.id);
       const eb = await agg.bundle(appId, extra, spend);
-      b.markets.push(eb.markets[0]!);
+      b.markets.push({ ...eb.markets[0]!, matchedBy: "caller" });
       b.warnings.push("Agg does not match these two markets as the same event. Compare them carefully: they may not be the same bet.");
-    } catch (e: any) { b.warnings.push(`Could not load the second market: ${e.message}`); }
+    } catch (e: any) {
+      b.markets.push({ venue: other.venue, aggId: null, yesOutcomeId: null, externalId: other.id, title: "", url: null, closeTime: null, rules: "", resolutionSource: null, mid: null, spread: null, yesAsk: null, feeRate: null,
+        status: "unavailable", unavailableReason: e?.name === "AbortError" ? "timed out" : String(e?.message ?? e), matchedBy: "caller" });
+    }
   }
   return b;
 }
@@ -61,10 +64,14 @@ async function loadPublic(inp: CheckInput): Promise<Bundle> {
   const jobs: Promise<VenueMarket>[] = [];
   if (inp.polymarket) jobs.push(polyRaw(parsePolymarket(inp.polymarket)).then(polyVM));
   if (inp.kalshi) jobs.push(kalshiVM(parseKalshi(inp.kalshi)));
+  const names = [inp.polymarket && "polymarket", inp.kalshi && "kalshi"].filter(Boolean) as string[];
+  const ids = [inp.polymarket, inp.kalshi].filter(Boolean) as string[];
   const got = await Promise.allSettled(jobs); const warnings: string[] = [];
-  const markets = got.flatMap((g) => (g.status === "fulfilled" ? [g.value] : (warnings.push(String(g.reason?.message)), [])));
-  if (!markets.length) throw new Error(`No market could be loaded: ${warnings.join("; ")}`);
-  return { source: "public", markets, anchorIndex: 0, settlementDiff: null, route: null, warnings };
+  const markets: VenueMarket[] = got.map((g, i) => g.status === "fulfilled" ? { ...g.value, status: g.value.mid === null ? "unavailable" : "ok", matchedBy: "caller" } as VenueMarket
+    : { venue: names[i]!, aggId: null, yesOutcomeId: null, externalId: ids[i]!, title: "", url: null, closeTime: null, rules: "", resolutionSource: null, mid: null, spread: null, yesAsk: null, feeRate: null,
+        status: "unavailable", unavailableReason: g.reason?.name === "AbortError" ? "timed out" : String(g.reason?.message ?? g.reason) } as VenueMarket);
+  if (!markets.some((m) => m.status === "ok" || m.rules)) throw new Error(`No market could be loaded: ${markets.map((m) => `${m.venue}: ${m.unavailableReason}`).join("; ")}`);
+  return { source: "public", markets, anchorIndex: Math.max(0, markets.findIndex((m) => !!m.rules)), settlementDiff: null, route: null, warnings };
 }
 
 export async function load(inp: CheckInput, appId: string | undefined): Promise<Bundle> {
@@ -82,57 +89,78 @@ export async function load(inp: CheckInput, appId: string | undefined): Promise<
 
 export function analyze(b: Bundle, inp: CheckInput) {
   const maxRisk = inp.maxRisk ?? 60;
-  const cross = crossVenue(b.markets, b.settlementDiff);
+  const live = b.markets.filter((m) => m.status !== "unavailable" || m.rules); // rules can still be scored without a price
+  const cross = crossVenue(live.filter((m) => m.rules), b.settlementDiff);
+  const crossRisk = score(cross);
   const venues = b.markets.map((m, i) => {
-    const flags = checkVenue(m);
-    const ask = m.yesAsk;
+    const flags = m.rules ? checkVenue(m) : [];
+    const ask = m.status === "unavailable" ? null : m.yesAsk;
     const isRouted = i === b.anchorIndex && b.route && b.route.venue === m.venue && b.route.shares > 0;
     const fee = ask !== null ? feePerContract(m, ask) : null;
     const allIn = isRouted ? r3(b.route!.totalCost / b.route!.shares) : ask !== null && fee !== null ? r3(ask + fee) : null;
-    return { m, flags, risk: score(flags), allIn, fee, priced: isRouted ? "agg_route_quote" : ask !== null ? "top_of_book_estimate" : "none" };
+    const venueRisk = m.rules ? score(flags) : null;
+    // Effective risk = this venue's own rules risk + cross-venue settlement risk (capped at 100).
+    const risk = venueRisk === null ? null : Math.min(100, venueRisk + crossRisk);
+    return { m, flags, venueRisk, risk, allIn, fee, priced: allIn === null ? "none" : isRouted ? "agg_route_quote" : "top_of_book_estimate" };
   });
-  const mids = venues.map((v) => v.m.mid).filter((x): x is number => x !== null);
+  const unavailable = venues.filter((v) => v.m.status === "unavailable");
+  const priced = venues.filter((v) => v.allIn !== null && v.m.mid !== null);
+  const mids = priced.map((v) => v.m.mid!);
+  const consensusOk = priced.length >= 2;
   const consensus = mids.length ? r3(mids.reduce((a, c) => a + c, 0) / mids.length) : null;
-  const lo = venues.map((v) => (v.m.mid ?? NaN) - (v.m.spread ?? 0) / 2).filter(Number.isFinite);
-  const hi = venues.map((v) => (v.m.mid ?? NaN) + (v.m.spread ?? 0) / 2).filter(Number.isFinite);
-  const range = lo.length ? [r3(Math.max(0, Math.min(...lo))), r3(Math.min(1, Math.max(...hi)))] as [number, number] : null;
+  const range = consensusOk ? [r3(Math.min(...mids)), r3(Math.max(...mids))] as [number, number] : null;
   const notes: string[] = [...b.warnings];
-  if (mids.length >= 2 && Math.max(...mids) - Math.min(...mids) >= 0.05) notes.push(`Venues disagree by ${Math.round((Math.max(...mids) - Math.min(...mids)) * 100)} points. Either one is mispriced or they are not the same bet; check the settlement differences.`);
+  if (unavailable.length) notes.push(`Unavailable: ${unavailable.map((v) => `${v.m.venue} (${v.m.unavailableReason ?? "no price"})`).join(", ")}. The decision ignores these venues.`);
+  if (consensusOk && Math.max(...mids) - Math.min(...mids) >= 0.05) notes.push(`Venues disagree by ${Math.round((Math.max(...mids) - Math.min(...mids)) * 100)} points. Either one is mispriced or they are not the same bet; check the settlement differences.`);
 
-  const eligible = venues.filter((v) => v.allIn !== null && v.risk < maxRisk).sort((a, b2) => a.allIn! - b2.allIn! || a.risk - b2.risk);
+  const scored = venues.filter((v) => v.risk !== null);
+  const safest = scored.length ? Math.min(...scored.map((v) => v.risk!)) : 100;
+  const eligible = priced.filter((v) => v.risk !== null && v.risk < maxRisk).sort((a, c) => a.allIn! - c.allIn! || a.risk! - c.risk!);
   const best = eligible[0] ?? null;
-  const basis = inp.fairValue !== undefined ? "your_fair_value" : "cross_venue_consensus";
-  const center = inp.fairValue ?? (range ? range[1] : consensus);
-  const riskFor = best?.risk ?? Math.min(...venues.map((v) => v.risk));
+  const basis = inp.fairValue !== undefined ? "your_fair_value" : consensusOk ? "cross_venue_consensus" : "none";
+  const riskFor = best?.risk ?? safest;
   const haircut = Math.max(0, riskFor - 20) / 300; // risk above 20 shaves value: 50 risk = -10%
-  // Consensus mode: you may pay up to the top of the cross-venue range plus the venue fee. Your-view mode: fees come out of your edge.
-  const feeAllowance = basis === "cross_venue_consensus" && best?.fee ? best.fee : 0;
-  const maxPrice = center !== null ? r3(Math.max(0, (center + feeAllowance) * (1 - haircut))) : null;
+  // Reference price: your fair value, or the top of the cross-venue midpoint range plus the venue fee and 1c tolerance.
+  const ref = inp.fairValue !== undefined ? inp.fairValue : range && best ? range[1] + (best.fee ?? 0) + 0.01 : null;
+  const maxPrice = ref !== null ? r3(Math.max(0, ref * (1 - haircut))) : null;
+  const headroom = maxPrice !== null && best ? r3(maxPrice - best.allIn!) : null;
+  const unavail = unavailable.length ? ` (${unavailable.map((v) => v.m.venue).join(", ")} unavailable)` : "";
   let action: "trade" | "skip" = "skip"; let reason: string;
-  if (!best) reason = venues.every((v) => v.risk >= maxRisk) ? `Skip: resolution risk is ${Math.min(...venues.map((v) => v.risk))}/100 on the safest venue, at or above your limit of ${maxRisk}.` : "Skip: no venue has a live YES price.";
-  else if (maxPrice === null) reason = "Skip: no reference price.";
-  else if (best.allIn! <= maxPrice) {
+  if (!best) {
+    reason = priced.length === 0 ? `Skip: no venue has a live YES price${unavail}.`
+      : `Skip: effective resolution risk is ${safest}/100 on the safest venue (rules ${Math.min(...scored.map((v) => v.venueRisk!))} + cross-venue ${crossRisk}), at or above your limit of ${maxRisk}.`;
+  } else if (basis === "none") {
+    reason = `Skip: only one venue (${best.m.venue}) has a live price${unavail}, so Fine Print has no independent price to check it against. Pass fairValue to decide on your own view.`;
+  } else if (best.allIn! > maxPrice!) {
+    reason = basis === "your_fair_value"
+      ? `Skip: no edge. Best all-in cost ${best.allIn} on ${best.m.venue} is above your fair value ${inp.fairValue} after a ${Math.round(haircut * 100)}% risk haircut (max ${maxPrice}).`
+      : haircut > 0 && best.allIn! <= ref!
+        ? `Skip: price ${best.allIn} on ${best.m.venue} is within the fair-value range ${range![0]}-${range![1]} from ${priced.length} venues plus fees, but effective risk ${riskFor}/100 cuts the max price by ${Math.round(haircut * 100)}% to ${maxPrice}. Not worth the settlement risk at this price${unavail}.`
+        : `Skip: price ${best.allIn} on ${best.m.venue} is above the fair-value range ${range![0]}-${range![1]} from ${priced.length} venues plus fees (max ${maxPrice}). No edge${unavail}.`;
+  } else {
     action = "trade";
     reason = basis === "your_fair_value"
-      ? `Trade: buy YES on ${best.m.venue} up to ${maxPrice}. All-in cost now is ${best.allIn}, against your fair value of ${inp.fairValue} after a risk haircut.`
-      : `OK to enter: buy YES on ${best.m.venue} up to ${maxPrice}. The price is in line with the other venues and the rules are acceptable. This is not a claim of edge; pass fairValue to test your own view.`;
-  } else reason = `Skip: best all-in cost ${best.allIn} on ${best.m.venue} is above the risk-adjusted max price of ${maxPrice}.`;
+      ? `Trade: buy YES on ${best.m.venue} up to ${maxPrice}. All-in cost now is ${best.allIn}, against your fair value of ${inp.fairValue} after a ${Math.round(haircut * 100)}% risk haircut${unavail}.`
+      : `OK to enter: buy YES on ${best.m.venue} up to ${maxPrice}. Its all-in price ${best.allIn} is within the fair-value range on ${priced.length} venues (${range![0]}-${range![1]} plus fees) and effective risk is ${best.risk}/100. This is not a claim of edge; pass fairValue to test your own view${unavail}.`;
+  }
 
   const allFlags: Flag[] = [...venues.flatMap((v) => v.flags), ...cross];
-  const bestRisk = best ? best.risk : Math.min(...venues.map((v) => v.risk));
   const top = topFlag(best ? [...best.flags, ...cross] : allFlags);
+  const anchor = venues[b.anchorIndex]!;
   return {
     product: "Fine Print",
-    question: clip(venues[b.anchorIndex]!.m.title, 200),
-    riskScore: bestRisk, riskLevel: level(bestRisk),
-    crossVenueRisk: score(cross),
+    question: clip(anchor.m.title, 200),
+    riskScore: riskFor, riskLevel: level(riskFor),
+    venueRisk: best?.venueRisk ?? (scored.length ? Math.min(...scored.map((v) => v.venueRisk!)) : null),
+    crossVenueRisk: crossRisk,
     topRisk: top,
     flags: allFlags.filter((f) => f.severity !== "info" || f.quote),
-    venues: venues.map((v) => ({ venue: v.m.venue, marketId: v.m.externalId, url: v.m.url, closeTime: v.m.closeTime, midpoint: v.m.mid !== null ? r3(v.m.mid) : null,
-      allInYesCost: v.allIn, feePerContract: v.fee, pricing: v.priced, riskScore: v.risk, riskLevel: level(v.risk) })),
+    venues: venues.map((v) => ({ venue: v.m.venue, marketId: v.m.externalId, status: v.m.status ?? "ok", unavailableReason: v.m.unavailableReason ?? null, matchedBy: v.m.matchedBy ?? null,
+      url: v.m.url, closeTime: v.m.closeTime, midpoint: v.m.mid !== null ? r3(v.m.mid) : null,
+      allInYesCost: v.allIn, feePerContract: v.fee, pricing: v.priced, riskScore: v.risk, riskLevel: v.risk === null ? null : level(v.risk) })),
     bestVenue: best?.m.venue ?? null,
-    fairValue: { basis, estimate: inp.fairValue ?? consensus, range: inp.fairValue !== undefined ? null : range },
-    decision: { action, side: "YES" as const, venue: best?.m.venue ?? null, maxPrice, maxRiskPolicy: maxRisk, reason },
+    fairValue: { basis, estimate: inp.fairValue ?? (consensusOk ? consensus : null), range, pricedVenues: priced.length },
+    decision: { action, side: "YES" as const, venue: best?.m.venue ?? null, maxPrice, headroom, maxRiskPolicy: maxRisk, reason },
     notes,
     dataSource: b.source === "agg" ? "Agg.market (matching, prices, settlement differences) + Fine Print analysis" : "Polymarket and Kalshi public APIs + Fine Print analysis",
   };

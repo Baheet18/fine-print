@@ -8,8 +8,8 @@ import * as z from "zod/v4";
 import { proposeX402, x402OutputSchema } from "./paybox.js";
 
 const PROTOCOL_VERSION = "2026-07-28";
-const DEFAULT_URL = "https://fine-print.vercel.app"; // overridden by the FINE_PRINT_URL environment variable in the PayBox portal
-const serviceUrl = () => (process.env.FINE_PRINT_URL || DEFAULT_URL).replace(/\/+$/, "");
+import { resolveServiceUrl } from "./config.js";
+const serviceUrl = () => resolveServiceUrl();
 const MAX_ATOMIC = process.env.FINE_PRINT_MAX_ATOMIC_USDC || "100000"; // 0.10 USDC ceiling; service charges 0.05
 
 const marketInput = {
@@ -48,7 +48,8 @@ function createServer() {
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async (a) => {
     if (needMarket(a)) return err("Give polymarket, kalshi or question.");
-    const r = proposeX402({ chain: "eip155:8453", url: `${serviceUrl()}/v1/check?${query(a)}`, maxAmount: MAX_ATOMIC });
+    let base: string; try { base = serviceUrl(); } catch (e: any) { return err(e.message); }
+    const r = proposeX402({ chain: "eip155:8453", url: `${base}/v1/check?${query(a)}`, maxAmount: MAX_ATOMIC });
     r.content = [{ type: "text", text: "Proposed a Fine Print check (up to 0.10 USDC; the service charges 0.05). After you approve, PayBox pays and returns the risk report and the trade-or-skip decision. Nothing has been paid yet." }];
     return r;
   });
@@ -67,7 +68,7 @@ function createServer() {
     if (needMarket(a)) return err("Give polymarket, kalshi or question.");
     const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 8000);
     try {
-      const res = await fetch(`${serviceUrl()}/v1/preview?${query(a)}`, { headers: { accept: "application/json" }, signal: ctl.signal });
+      const res = await fetch(`${resolveServiceUrl()}/v1/preview?${query(a)}`, { headers: { accept: "application/json" }, signal: ctl.signal });
       const d: any = await res.json().catch(() => ({}));
       if (!res.ok) return err(`Fine Print: ${d.error ?? `HTTP ${res.status}`}`);
       const out = { question: d.question ?? null, riskScore: Number(d.riskScore), riskLevel: String(d.riskLevel), topRisk: d.topRisk ?? null, venues: Array.isArray(d.venues) ? d.venues.map(String) : [] };
