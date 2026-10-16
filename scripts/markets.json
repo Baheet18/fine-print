@@ -1,0 +1,47 @@
+{
+ "fed_hike": {
+  "kalshi": "KXFEDDECISION-26DEC-H25"
+ },
+ "lisa_cook": {
+  "polymarket": "3409509"
+ },
+ "btc_eoy": {
+  "kalshi": "KXBTCY-27JAN0100-B122500"
+ },
+ "gpt7": {
+  "kalshi": "KXGPT-GPT7-27MAR01"
+ },
+ "hegseth_2028": {
+  "polymarket": "561264"
+ },
+ "shutdown_house": {
+  "polymarket": "902978"
+ },
+ "taylor_tv": {
+  "kalshi": "KXNEWTAYLOR-TS-27"
+ },
+ "epl_brentford": {
+  "polymarket": "2771327"
+ },
+ "us_recession": {
+  "q": "US recession by end of 2026"
+ },
+ "ceasefire": {
+  "polymarket": "2264328"
+ },
+ "musk_run": {
+  "polymarket": "665482"
+ },
+ "hawaii_hurr": {
+  "polymarket": "3081724"
+ },
+ "cpi_nov": {
+  "kalshi": "KXCPIYOY-26NOV-T4.1"
+ },
+ "tiktok_stake": {
+  "polymarket": "1323323"
+ },
+ "uk_socialban": {
+  "polymarket": "2571638"
+ }
+}
